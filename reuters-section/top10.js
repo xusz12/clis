@@ -11,6 +11,8 @@ async function loadOpencliRegistry() {
 const { cli, Strategy } = await loadOpencliRegistry();
 
 const REUTERS_HOME = 'https://www.reuters.com';
+const INITIAL_WAIT_SECONDS = 2;
+const RECOVERY_WAIT_MS = 10_000;
 const MAX_LIMIT = 50;
 
 function escapeForTemplate(value) {
@@ -18,6 +20,11 @@ function escapeForTemplate(value) {
     .replace(/\\/g, '\\\\')
     .replace(/`/g, '\\`')
     .replace(/\$\{/g, '\\${');
+}
+
+function isReutersHostname(hostname) {
+  const normalized = String(hostname || '').toLowerCase();
+  return normalized === 'reuters.com' || normalized.endsWith('.reuters.com');
 }
 
 cli({
@@ -35,28 +42,30 @@ cli({
   func: async (page, kwargs) => {
     const sectionUrl = String(kwargs.url || '').trim();
     const count = Math.max(1, Math.min(Number(kwargs.limit) || 10, MAX_LIMIT));
+    let parsed;
+
+    if (!sectionUrl) {
+      throw new Error('url is required');
+    }
+
+    try {
+      parsed = new URL(sectionUrl);
+    } catch {
+      throw new Error('Invalid URL: ' + sectionUrl);
+    }
+
+    if (!isReutersHostname(parsed.hostname)) {
+      throw new Error('Only reuters.com URLs are supported');
+    }
 
     await page.goto(REUTERS_HOME);
-    await page.wait(2);
+    await page.wait(INITIAL_WAIT_SECONDS);
 
     const payload = await page.evaluate(`(async () => {
       const sectionUrl = \`${escapeForTemplate(sectionUrl)}\`.trim();
       const count = ${count};
-
-      if (!sectionUrl) {
-        return { error: 'url is required' };
-      }
-
-      let parsed;
-      try {
-        parsed = new URL(sectionUrl);
-      } catch {
-        return { error: 'Invalid URL: ' + sectionUrl };
-      }
-
-      if (!/reuters\\.com$/.test(parsed.hostname)) {
-        return { error: 'Only reuters.com URLs are supported' };
-      }
+      const recoveryWaitMs = ${RECOVERY_WAIT_MS};
+      const parsed = new URL(sectionUrl);
 
       const cleanPath = parsed.pathname.replace(/^\\/+|\\/+$/g, '');
       const collectionAlias = cleanPath ? cleanPath.replace(/\\//g, '-') : 'world';
@@ -72,20 +81,36 @@ cli({
         'https://www.reuters.com/pf/api/v3/content/fetch/articles-by-collection-alias-or-id-v1?query=' +
         encodeURIComponent(apiQuery);
 
-      try {
-        const resp = await fetch(apiUrl, { credentials: 'include' });
-        if (!resp.ok) {
-          return {
-            error: 'HTTP ' + resp.status + ' for alias ' + collectionAlias,
-            status: resp.status,
-            alias: collectionAlias,
-          };
-        }
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const isReutersHostname = (hostname) => {
+        const normalized = String(hostname || '').toLowerCase();
+        return normalized === 'reuters.com' || normalized.endsWith('.reuters.com');
+      };
+      const isInterstitialHostname = (hostname) => {
+        const normalized = String(hostname || '').toLowerCase();
+        return normalized === 'geo.captcha-delivery.com' || normalized.endsWith('.geo.captcha-delivery.com');
+      };
 
-        const data = await resp.json();
-        const root = data?.result || data?.data?.data || data?.data || data;
-        const items = root?.articles || root?.content_elements || root?.list || [];
+      const getPageState = () => {
+        const href = String(location.href || '');
+        const hostname = String(location.hostname || '');
+        const title = String(document.title || '');
+        const isInterstitialHost = isInterstitialHostname(hostname);
+        const isInterstitialUrl = /interstitial/i.test(href);
+        const isDataDomeTitle = /datadome|device check/i.test(title);
+        const isReutersHost = isReutersHostname(hostname);
+        const isReutersTitle = /reuters/i.test(title);
 
+        return {
+          href,
+          hostname,
+          title,
+          isReutersReady: isReutersHost && isReutersTitle && !isDataDomeTitle,
+          isInterstitial: isInterstitialHost || isInterstitialUrl || isDataDomeTitle,
+        };
+      };
+
+      const formatItems = (items) => {
         const fmt = new Intl.DateTimeFormat('zh-CN', {
           timeZone: 'Asia/Shanghai',
           year: 'numeric',
@@ -128,6 +153,104 @@ cli({
             };
           })
           .filter((item) => item.title && item.url);
+      };
+
+      const fetchArticles = async () => {
+        const pageState = getPageState();
+
+        try {
+          const resp = await fetch(apiUrl, { credentials: 'include' });
+          if (!resp.ok) {
+            return {
+              ok: false,
+              retryable: resp.status === 401 || pageState.isInterstitial,
+              error: 'HTTP ' + resp.status + ' for alias ' + collectionAlias,
+              status: resp.status,
+              alias: collectionAlias,
+              pageState,
+            };
+          }
+
+          const data = await resp.json();
+          const root = data?.result || data?.data?.data || data?.data || data;
+          const items = root?.articles || root?.content_elements || root?.list;
+
+          if (!Array.isArray(items)) {
+            return {
+              ok: false,
+              retryable: false,
+              error: 'Unexpected Reuters response structure for alias ' + collectionAlias,
+              alias: collectionAlias,
+              pageState,
+            };
+          }
+
+          const formattedItems = formatItems(items);
+          if (formattedItems.length === 0) {
+            return {
+              ok: false,
+              retryable: true,
+              error: 'Empty result for alias ' + collectionAlias,
+              alias: collectionAlias,
+              pageState,
+            };
+          }
+
+          return {
+            ok: true,
+            items: formattedItems,
+            pageState,
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            retryable: false,
+            error: String(error),
+            alias: collectionAlias,
+            pageState,
+          };
+        }
+      };
+
+      const waitForReutersRecovery = async () => {
+        const deadline = Date.now() + recoveryWaitMs;
+
+        while (Date.now() < deadline) {
+          const pageState = getPageState();
+          if (!pageState.isInterstitial && pageState.isReutersReady) {
+            return pageState;
+          }
+
+          await sleep(500);
+        }
+
+        return getPageState();
+      };
+
+      try {
+        const firstAttempt = await fetchArticles();
+        if (firstAttempt.ok) {
+          return firstAttempt.items;
+        }
+
+        if (!firstAttempt.retryable) {
+          return firstAttempt;
+        }
+
+        await waitForReutersRecovery();
+        const secondAttempt = await fetchArticles();
+        if (secondAttempt.ok) {
+          return secondAttempt.items;
+        }
+
+        return {
+          ...secondAttempt,
+          retryAttempted: true,
+          initialError: firstAttempt.error,
+          initialStatus: firstAttempt.status,
+          initialPageState: firstAttempt.pageState,
+          finalPageState: secondAttempt.pageState,
+        };
       } catch (error) {
         return { error: String(error), alias: collectionAlias };
       }
