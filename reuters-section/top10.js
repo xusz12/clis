@@ -90,11 +90,33 @@ cli({
         const normalized = String(hostname || '').toLowerCase();
         return normalized === 'geo.captcha-delivery.com' || normalized.endsWith('.geo.captcha-delivery.com');
       };
+      const getDataDomeIframeSignals = () => {
+        const frames = Array.from(document.querySelectorAll('iframe'));
+        const matchingFrames = frames.filter((frame) => {
+          const src = String(frame.getAttribute('src') || '');
+          const title = String(frame.getAttribute('title') || '');
+          return (
+            /captcha-delivery\\.com/i.test(src) ||
+            /datadome/i.test(title) ||
+            /device check/i.test(title)
+          );
+        });
+
+        return {
+          count: matchingFrames.length,
+          samples: matchingFrames.slice(0, 3).map((frame) => ({
+            src: String(frame.getAttribute('src') || ''),
+            title: String(frame.getAttribute('title') || ''),
+          })),
+        };
+      };
 
       const getPageState = () => {
         const href = String(location.href || '');
         const hostname = String(location.hostname || '');
         const title = String(document.title || '');
+        const iframeSignals = getDataDomeIframeSignals();
+        const hasDataDomeIframe = iframeSignals.count > 0;
         const isInterstitialHost = isInterstitialHostname(hostname);
         const isInterstitialUrl = /interstitial/i.test(href);
         const isDataDomeTitle = /datadome|device check/i.test(title);
@@ -105,8 +127,11 @@ cli({
           href,
           hostname,
           title,
-          isReutersReady: isReutersHost && isReutersTitle && !isDataDomeTitle,
-          isInterstitial: isInterstitialHost || isInterstitialUrl || isDataDomeTitle,
+          iframeSignals,
+          hasDataDomeIframe,
+          isReutersReady: isReutersHost && isReutersTitle && !isDataDomeTitle && !hasDataDomeIframe,
+          isInterstitial:
+            isInterstitialHost || isInterstitialUrl || isDataDomeTitle || hasDataDomeIframe,
         };
       };
 
@@ -214,17 +239,38 @@ cli({
 
       const waitForReutersRecovery = async () => {
         const deadline = Date.now() + recoveryWaitMs;
+        let lastAttempt = null;
 
         while (Date.now() < deadline) {
           const pageState = getPageState();
-          if (!pageState.isInterstitial && pageState.isReutersReady) {
-            return pageState;
+          if (pageState.isInterstitial || !pageState.isReutersReady) {
+            await sleep(500);
+            continue;
           }
 
+          lastAttempt = await fetchArticles();
+          if (lastAttempt.ok || !lastAttempt.retryable) {
+            return lastAttempt;
+          }
           await sleep(500);
         }
 
-        return getPageState();
+        if (lastAttempt) {
+          return {
+            ...lastAttempt,
+            recoveryTimedOut: true,
+            finalPageState: getPageState(),
+          };
+        }
+
+        return {
+          ok: false,
+          retryable: true,
+          error: 'Timed out waiting for Reuters recovery for alias ' + collectionAlias,
+          alias: collectionAlias,
+          recoveryTimedOut: true,
+          finalPageState: getPageState(),
+        };
       };
 
       try {
@@ -237,19 +283,18 @@ cli({
           return firstAttempt;
         }
 
-        await waitForReutersRecovery();
-        const secondAttempt = await fetchArticles();
-        if (secondAttempt.ok) {
-          return secondAttempt.items;
+        const recoveryAttempt = await waitForReutersRecovery();
+        if (recoveryAttempt.ok) {
+          return recoveryAttempt.items;
         }
 
         return {
-          ...secondAttempt,
+          ...recoveryAttempt,
           retryAttempted: true,
           initialError: firstAttempt.error,
           initialStatus: firstAttempt.status,
           initialPageState: firstAttempt.pageState,
-          finalPageState: secondAttempt.pageState,
+          finalPageState: recoveryAttempt.finalPageState || recoveryAttempt.pageState,
         };
       } catch (error) {
         return { error: String(error), alias: collectionAlias };
