@@ -5,6 +5,6 @@ const { cli, Strategy } = await loadOpencliRegistry();
 cli(createBloombergUserCliConfig({
   cli,
   Strategy,
-  name: 'main',
-  description: 'Bloomberg homepage top stories via RSS with Asia/Shanghai time',
+  name: 'tech',
+  description: 'Bloomberg Tech top stories via RSS with Asia/Shanghai time',
 }));
