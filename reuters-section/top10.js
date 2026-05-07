@@ -31,6 +31,7 @@ cli({
   site: 'ReutersBrowser',
   name: 'news',
   description: 'Reuters section top stories with Asia/Shanghai local time',
+  access: 'read',
   domain: 'www.reuters.com',
   strategy: Strategy.COOKIE,
   browser: true,

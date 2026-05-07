@@ -83,6 +83,7 @@ cli({
   site: 'ArsPublic',
   name: 'news',
   description: 'Ars Technica top stories (title, time, url) with Asia/Shanghai time',
+  access: 'read',
   domain: 'feeds.arstechnica.com',
   strategy: Strategy.PUBLIC,
   browser: false,
@@ -90,7 +91,7 @@ cli({
     { name: 'limit', type: 'int', default: 10, help: 'Number of items to return (max 30)' },
   ],
   columns: ['rank', 'title', 'time', 'url'],
-  func: async (_page, kwargs) => {
+  func: async (kwargs) => {
     const count = Math.max(1, Math.min(Number(kwargs.limit) || 10, 30));
     const resp = await fetch(FEED_URL, { headers: { 'User-Agent': USER_AGENT } });
     if (!resp.ok) throw new Error(`Ars RSS HTTP ${resp.status}`);

@@ -119,6 +119,7 @@ export function createBloombergUserCliConfig({ cli, Strategy, name, description 
     site: 'BloombergUser',
     name,
     description,
+    access: 'read',
     domain: 'feeds.bloomberg.com',
     strategy: Strategy.PUBLIC,
     browser: false,
@@ -126,7 +127,7 @@ export function createBloombergUserCliConfig({ cli, Strategy, name, description 
       { name: 'limit', type: 'int', default: DEFAULT_LIMIT, help: `Number of feed items to return (max ${MAX_LIMIT})` },
     ],
     columns: ['rank', 'title', 'time', 'url', 'summary'],
-    func: async (_page, kwargs) => {
+    func: async (kwargs) => {
       return fetchBloombergUserFeed(name, kwargs.limit ?? DEFAULT_LIMIT);
     },
   };
