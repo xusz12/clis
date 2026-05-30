@@ -85,10 +85,46 @@ export function buildArticleDetailScript() {
             domArticle.display_date = dt.trim();
           }
         }
-        const paragraphs = Array.from(document.querySelectorAll('article [data-testid^="paragraph-"], article p'))
-          .map((p) => (p.textContent || '').trim())
+        const normalizeText = (value) => String(value || '')
+          .replace(/[\\u200B-\\u200D\\uFEFF]/g, '')
+          .replace(/,\\s*opens new tab\\.?/gi, '')
+          .replace(/\\s{2,}/g, ' ')
+          .trim();
+        const isNoiseParagraph = (text) => {
+          if (!text) return true;
+          return /^the reuters .*briefing newsletter\\b/i.test(text)
+            || /^sign up here\\.?$/i.test(text)
+            || /^subscribe\\b/i.test(text)
+            || /^advertisement\\b/i.test(text)
+            || /^recommended\\b/i.test(text);
+        };
+        const isHardStopParagraph = (text) => {
+          if (!text) return false;
+          return /^our standards:/i.test(text)
+            || /^purchase licensing rights/i.test(text)
+            || /^read next\\b/i.test(text)
+            || /^thomson reuters\\b/i.test(text);
+        };
+        const isAuthorBio = (text) => {
+          if (!text) return false;
+          return /\\bis a journalist\\b/i.test(text)
+            || /^our standards:/i.test(text);
+        };
+        const rawParagraphs = Array.from(document.querySelectorAll('article [data-testid^="paragraph-"], article p'))
+          .map((p) => normalizeText(p.textContent || ''))
           .filter(Boolean);
-        const bodyText = paragraphs.length ? paragraphs.join('\\n\\n') : ((document.querySelector('article')?.innerText || '').trim() || null);
+        const cleanedParagraphs = [];
+        for (const text of rawParagraphs) {
+          if (isNoiseParagraph(text)) continue;
+          if (isHardStopParagraph(text)) break;
+          if (/^reporting by\\b/i.test(text)) {
+            cleanedParagraphs.push(text);
+            break;
+          }
+          if (isAuthorBio(text)) break;
+          cleanedParagraphs.push(text);
+        }
+        const bodyText = cleanedParagraphs.length ? cleanedParagraphs.join('\\n\\n') : ((document.querySelector('article')?.innerText || '').trim() || null);
         const hasRealContent = bodyText && bodyText.length >= 200;
         const pageText = document.body ? (document.body.innerText || '') : '';
         const authWallText = ${looksAuthWallText.toString()}([
