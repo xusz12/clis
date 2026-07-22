@@ -1,140 +1,245 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { cli, Strategy } from '@jackwener/opencli/registry';
 
-async function loadOpencliRegistry() {
-  const entry = fs.realpathSync(process.argv[1]);
-  const registryPath = path.resolve(path.dirname(entry), 'registry.js');
-  return import(pathToFileURL(registryPath).href);
-}
-
-const { cli, Strategy } = await loadOpencliRegistry();
-
-const USER_AGENT = 'Mozilla/5.0 (compatible; opencli-custom)';
 const SITE = 'Ars Technica';
 const DOMAIN_RE = /^https?:\/\/(?:www\.)?arstechnica\.com\//i;
+const CHALLENGE_RE = /datadome|verify you are human|captcha|access to this page has been denied|unusual traffic|subscribe to continue|subscription required|sign in to continue|log in to continue/i;
+const ARTICLE_READY_TIMEOUT_MS = 15000;
+const ARTICLE_READY_POLL_SECONDS = 1;
 
-function failure(url, errorCode, reason) {
-  return {
-    source: SITE,
-    title: '',
-    url,
-    published_at: '',
-    author: '',
-    content: '',
-    content_length: 0,
-    status: 'failed',
-    error_code: errorCode,
-    reason,
-  };
+function normalizeText(value) {
+  return String(value ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/,\s*opens new tab\.?/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
-function decodeHtml(text) {
-  return String(text || '')
-    .replace(/&#8216;/g, "'")
-    .replace(/&#8217;/g, "'")
-    .replace(/&#8220;/g, '"')
-    .replace(/&#8221;/g, '"')
-    .replace(/&#8230;/g, '...')
-    .replace(/&#038;/g, '&')
-    .replace(/&#039;/g, "'")
-    .replace(/&#(\d+);/g, (_, code) => {
-      const n = Number(code);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : _;
-    })
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+function normalizeContentText(value) {
+  return dedupeLines(
+    String(value ?? '')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/\r\n?/g, '\n')
+      .split(/\n+/)
+      .map((line) => normalizeText(line))
+      .filter(Boolean),
+  ).join('\n\n');
 }
 
-function extractMeta(html, property) {
-  const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i');
-  const m = html.match(re);
-  return m ? decodeHtml(m[1]).trim() : '';
-}
-
-function extractTitle(html) {
-  const m = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-  if (m) {
-    return decodeHtml(m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')).trim();
-  }
-  return extractMeta(html, 'og:title');
-}
-
-function extractAuthor(html) {
-  const m = html.match(/<a[^>]*rel=["']author["'][^>]*>([\s\S]*?)<\/a>/i)
-    || html.match(/<span[^>]*class=["'][^"']*byline[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
-  if (m) {
-    return decodeHtml(m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')).trim();
-  }
-  return extractMeta(html, 'author');
-}
-
-function extractByBalancedTag(html, tag, classNeedle) {
-  const openRe = new RegExp(`<${tag}[^>]*class=["'][^"']*${classNeedle}[^"']*["'][^>]*>`, 'i');
-  const openMatch = openRe.exec(html);
-  if (!openMatch) return '';
-
-  const start = openMatch.index;
-  const tagRe = new RegExp(`<\\/?${tag}\\b[^>]*>`, 'gi');
-  tagRe.lastIndex = start;
-
-  let depth = 0;
-  let begin = -1;
-  let end = -1;
-  let m;
-  while ((m = tagRe.exec(html))) {
-    const isClose = m[0][1] === '/';
-    if (!isClose) {
-      if (depth === 0 && begin === -1) begin = m.index;
-      depth += 1;
-    } else {
-      depth -= 1;
-      if (depth === 0) {
-        end = tagRe.lastIndex;
-        break;
-      }
-    }
-  }
-  if (begin === -1 || end === -1) return '';
-  return html.slice(begin, end);
-}
-
-function toLinesFromHtml(block) {
-  let cleaned = String(block || '');
-  cleaned = cleaned.replace(/<script[\s\S]*?<\/script>/gi, '');
-  cleaned = cleaned.replace(/<style[\s\S]*?<\/style>/gi, '');
-  cleaned = cleaned.replace(/<noscript[\s\S]*?<\/noscript>/gi, '');
-  cleaned = cleaned.replace(/<div[^>]*class=["'][^"']*(?:video|ad|newsletter|related|comments|social|text-settings)[^"']*["'][\s\S]*?<\/div>/gi, '');
-  cleaned = cleaned.replace(/<aside[^>]*class=["'][^"']*(?:sidebar|author|newsletter|related|video)[^"']*["'][\s\S]*?<\/aside>/gi, '');
-  cleaned = cleaned.replace(/<figure[\s\S]*?<\/figure>/gi, '');
-  cleaned = cleaned.replace(/<\/p>/gi, '\n');
-  cleaned = cleaned.replace(/<\/(?:h2|h3|h4|blockquote|li|ul|ol)>/gi, '\n');
-  cleaned = cleaned.replace(/<br\s*\/?\s*>/gi, '\n');
-  cleaned = decodeHtml(cleaned.replace(/<[^>]+>/g, ' '));
-
-  return cleaned
-    .split(/\n+/)
-    .map((line) => line.replace(/\s+/g, ' ').trim())
-    .filter(Boolean)
-    .filter((line) => !/^(Text settings|Comments|Subscribe|Read this next)$/i.test(line))
-    .filter((line) => !/^(Ars Video|Most Popular|Latest Stories)$/i.test(line))
-    .filter((line) => !/^(Reader comments|Image Credits?)$/i.test(line))
-    .filter((line) => !/Terms of Use|Privacy Policy|Cookie Policy/i.test(line));
-}
-
-function normalizeContent(lines) {
+function dedupeLines(lines) {
   const output = [];
   for (const line of lines) {
     if (!line) continue;
     if (output[output.length - 1] === line) continue;
     output.push(line);
   }
-  return output.join('\n\n').trim();
+  return output;
+}
+
+function mapDetail(article, bodyText, fallbackUrl = null) {
+  if (!article && !bodyText) return null;
+  const title = normalizeText(article?.title);
+  const publishedAt = normalizeText(article?.published_at);
+  const author = normalizeText(article?.author);
+  const canonicalUrl = normalizeText(article?.canonical_url) || normalizeText(fallbackUrl);
+  const body = normalizeContentText(bodyText);
+
+  return {
+    title: title || null,
+    published_at: publishedAt || null,
+    authors: author || null,
+    url: canonicalUrl || null,
+    content: body || null,
+    content_length: body ? body.length : 0,
+  };
+}
+
+function buildArticleDetailScript() {
+  return `
+    (() => {
+      try {
+        const normalize = (value) => String(value ?? '')
+          .replace(/[\\u200B-\\u200D\\uFEFF]/g, '')
+          .replace(/,\\s*opens new tab\\.?/gi, '')
+          .replace(/\\s{2,}/g, ' ')
+          .trim();
+
+        const dedupeLines = (lines) => {
+          const output = [];
+          for (const line of lines) {
+            if (!line) continue;
+            if (output[output.length - 1] === line) continue;
+            output.push(line);
+          }
+          return output;
+        };
+
+        const title =
+          normalize(document.querySelector('main#main article h1')?.textContent) ||
+          normalize(document.querySelector('article h1')?.textContent) ||
+          normalize(document.querySelector('h1')?.textContent) ||
+          normalize(document.querySelector('meta[property="og:title"]')?.content) ||
+          normalize(document.title);
+
+        const canonicalUrl =
+          normalize(document.querySelector('link[rel="canonical"]')?.href) ||
+          normalize(document.querySelector('meta[property="og:url"]')?.content);
+
+        const publishedAt =
+          normalize(document.querySelector('main#main article time[title]')?.getAttribute('title')) ||
+          normalize(document.querySelector('article time[title]')?.getAttribute('title')) ||
+          normalize(document.querySelector('article time[datetime]')?.getAttribute('datetime')) ||
+          normalize(document.querySelector('meta[property="article:published_time"]')?.content) ||
+          normalize(document.querySelector('meta[name="article:published_time"]')?.content) ||
+          normalize(document.querySelector('article time')?.textContent);
+
+        const authorNodes = Array.from(document.querySelectorAll(
+          'article a[rel="author"], article [rel="author"], article [class*="byline"], article a[href*="/author/"]'
+        ))
+          .map((node) => normalize(node.textContent))
+          .map((text) => text.replace(/^By\\s+/i, '').trim())
+          .filter(Boolean);
+        const authors = Array.from(new Set(authorNodes)).join(', ');
+
+        const container =
+          document.querySelector('main#main article') ||
+          document.querySelector('article') ||
+          document.querySelector('main#main');
+
+        const contentSelector = [
+          'main#main article .post-content p',
+          'main#main article .post-content h2',
+          'main#main article .post-content h3',
+          'main#main article .post-content h4',
+          'main#main article .post-content blockquote',
+          'article .post-content p',
+          'article .post-content h2',
+          'article .post-content h3',
+          'article .post-content h4',
+          'article .post-content blockquote'
+        ].join(', ');
+        const blockNodes = Array.from(document.querySelectorAll(contentSelector));
+        const noiseAncestorSelector = [
+          '.ars-interlude-container',
+          '.ad-wrapper',
+          '.ad',
+          '.advertisement',
+          'aside',
+          'figure',
+          'figcaption',
+          'nav',
+          'header',
+          'footer',
+          '[class*="caption"]',
+          '[class*="comment"]',
+          '[class*="newsletter"]',
+          '[class*="popular"]',
+          '[class*="related"]',
+          '[class*="share"]',
+          '[class*="social"]',
+          '[class*="teaser"]',
+          '[class*="video"]'
+        ].join(', ');
+
+        const isNoise = (text) => {
+          if (!text) return true;
+          return /^(Advertisement|Ars Video\\b.*|Sign up here|Subscribe|Read this next|Related|Most Popular|Latest Stories|Comments|Reader comments|Image Credits?)$/i.test(text)
+            || /cookie policy|privacy policy|terms of use/i.test(text)
+            || /newsletter|most popular|related stories|reader comments/i.test(text)
+            || /^follow us on/i.test(text);
+        };
+
+        const bodyLines = [];
+        for (const node of blockNodes) {
+          if (node.closest(noiseAncestorSelector)) continue;
+          const text = normalize(node.textContent);
+          if (isNoise(text)) continue;
+          if (/^Our standards:/i.test(text) || /^Purchase Licensing Rights/i.test(text)) break;
+          bodyLines.push(text);
+        }
+
+        const bodyText = dedupeLines(bodyLines).join('\\n\\n');
+        const pageText = normalize(document.body?.innerText || '');
+        const h1Text = normalize(document.querySelector('main#main article h1')?.textContent);
+        const paragraphCount = document.querySelectorAll('main#main article .post-content p, article .post-content p').length;
+        const challengeText = ${CHALLENGE_RE.toString()}.test([
+          location.href || '',
+          document.title || '',
+          pageText.slice(0, 5000),
+        ].join('\\n'));
+        const authRequired = !title || bodyText.length < 200 ? challengeText : false;
+
+        return {
+          ok: true,
+          authRequired,
+          diagnostics: {
+            url: location.href || '',
+            title: document.title || '',
+            h1Text,
+            paragraphCount,
+            bodyLength: bodyText.length,
+            challengeText,
+          },
+          body: {
+            article: {
+              title: title || null,
+              published_at: publishedAt || null,
+              author: authors || null,
+              canonical_url: canonicalUrl || null,
+            },
+            bodyText,
+          },
+        };
+      } catch (error) {
+        return { ok: false, error: String((error && error.message) || error) };
+      }
+    })()
+  `;
+}
+
+async function readArticlePayload(page) {
+  let result;
+  try {
+    result = await page.evaluate(buildArticleDetailScript());
+  } catch (error) {
+    throw new CommandExecutionError(`ArsPublic article DOM evaluation failed: ${String(error?.message || error)}`);
+  }
+
+  if (result?.error) {
+    throw new CommandExecutionError(`ArsPublic article failed inside the page: ${result.error}`);
+  }
+  if (!result || result.ok !== true) {
+    throw new CommandExecutionError('ArsPublic article returned no payload');
+  }
+  return result;
+}
+
+async function waitForArticlePayload(page, url) {
+  const maxAttempts = Math.ceil(ARTICLE_READY_TIMEOUT_MS / (ARTICLE_READY_POLL_SECONDS * 1000)) + 1;
+  let lastResult = null;
+  let lastDetail = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const result = await readArticlePayload(page);
+    const detail = mapDetail(result.body?.article, result.body?.bodyText, url);
+    lastResult = result;
+    lastDetail = detail;
+
+    if (detail?.title && detail?.content && detail.content_length >= 200) {
+      return { result, detail };
+    }
+
+    if (attempt === maxAttempts - 1) break;
+    await page.wait(ARTICLE_READY_POLL_SECONDS);
+  }
+
+  if (lastResult?.authRequired || lastResult?.diagnostics?.challengeText) {
+    throw new AuthRequiredError('arstechnica.com', 'Ars Technica page is still blocked by browser verification');
+  }
+  if (!lastDetail || !lastDetail.title || !lastDetail.content) {
+    throw new EmptyResultError('ArsPublic article', 'Page rendered no article body');
+  }
+  throw new EmptyResultError('ArsPublic article', `Extracted content length ${lastDetail.content_length} < 200`);
 }
 
 cli({
@@ -143,50 +248,31 @@ cli({
   description: 'Ars Technica article detail by URL (title, author, published_at, content)',
   access: 'read',
   domain: 'arstechnica.com',
-  strategy: Strategy.PUBLIC,
-  browser: false,
+  strategy: Strategy.UI,
+  browser: true,
   args: [
     { name: 'url', positional: true, required: true, help: 'Ars Technica article URL' },
   ],
   columns: ['source', 'title', 'url', 'published_at', 'author', 'content', 'content_length', 'status'],
-  func: async (kwargs) => {
+  func: async (page, kwargs) => {
     const url = String(kwargs.url || '').trim();
-    if (!url) return [failure('', 'MALFORMED_URL', 'URL cannot be empty')];
-    if (!DOMAIN_RE.test(url)) return [failure(url, 'UNSUPPORTED_URL', 'Only arstechnica.com article URL is supported')];
+    if (!url) throw new ArgumentError('URL cannot be empty');
+    if (!DOMAIN_RE.test(url)) throw new ArgumentError('Only arstechnica.com article URL is supported');
 
-    let resp;
-    try {
-      resp = await fetch(url, { headers: { 'User-Agent': USER_AGENT } });
-    } catch (err) {
-      return [failure(url, 'NETWORK_ERROR', String(err?.message || err))];
-    }
-
-    const wafAction = String(resp.headers.get('x-amzn-waf-action') || '').toLowerCase();
-    if (resp.status === 202 || wafAction === 'challenge') {
-      return [failure(url, 'AUTH_REQUIRED', 'Ars Technica returned WAF challenge; authenticated browser/session is required')];
-    }
-    if (resp.status === 404) return [failure(url, 'NOT_FOUND', 'Article page returned 404')];
-    if (!resp.ok) return [failure(url, 'HTTP_ERROR', `HTTP ${resp.status}`)];
-
-    const html = await resp.text();
-    const block = extractByBalancedTag(html, 'div', 'post-content');
-    if (!block) return [failure(url, 'CONTENT_UNAVAILABLE', 'Article content container not found')];
-
-    const content = normalizeContent(toLinesFromHtml(block));
-    const contentLength = content.length;
-    if (contentLength < 200) {
-      return [failure(url, 'CONTENT_TOO_SHORT', `Extracted content length ${contentLength} < 200`)];
-    }
+    await page.goto(url);
+    const { detail } = await waitForArticlePayload(page, url);
 
     return [{
       source: SITE,
-      title: extractTitle(html),
-      url,
-      published_at: extractMeta(html, 'article:published_time'),
-      author: extractAuthor(html),
-      content,
-      content_length: contentLength,
+      title: detail.title,
+      url: detail.url,
+      published_at: detail.published_at,
+      author: detail.authors,
+      content: detail.content,
+      content_length: detail.content_length,
       status: 'success',
     }];
   },
 });
+
+export { buildArticleDetailScript, mapDetail, waitForArticlePayload };
